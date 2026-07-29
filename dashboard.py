@@ -197,6 +197,47 @@ with aba_geral:
         width="stretch",
     )
 
+    # Tempo médio por etapa do processo de lavagem. Como usa df_f (já recortado
+    # pelo filtro de Período da barra lateral), o comportamento pedido sai de
+    # graça: 1 dia selecionado -> média das lavagens daquele dia; vários dias
+    # -> média do período inteiro.
+    if data_inicio == data_fim:
+        legenda_periodo = f"{data_inicio.strftime('%d/%m/%Y')} ({len(df_f)} lavagens nesse dia)"
+    else:
+        n_dias = df_f["data"].dt.date.nunique()
+        legenda_periodo = (
+            f"{data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')} "
+            f"({n_dias} dias, {len(df_f)} lavagens)"
+        )
+
+    ETAPAS = {
+        "t_teto_vidros_min": "Teto / Vidros",
+        "t_capo_parabrisa_min": "Capô / Parabrisa",
+        "t_laterais_portas_min": "Laterais / Portas",
+        "t_traseira_min": "Traseira",
+        "t_rodas_pneus_min": "Rodas / Pneus",
+        "t_interior_min": "Interior",
+    }
+    tempo_etapas = (
+        df_f[list(ETAPAS.keys())]
+        .mean()
+        .rename(index=ETAPAS)
+        .reset_index()
+    )
+    tempo_etapas.columns = ["etapa", "tempo_medio_min"]
+
+    st.plotly_chart(
+        px.bar(
+            tempo_etapas,
+            x="etapa",
+            y="tempo_medio_min",
+            text_auto=".1f",
+            title=f"Tempo médio por etapa da lavagem — {legenda_periodo}",
+            labels={"etapa": "Etapa", "tempo_medio_min": "Tempo médio (min)"},
+        ),
+        width="stretch",
+    )
+
     # -------------------------------------------------------------- pagamento
     st.subheader("Financeiro: mix de pagamento")
 
