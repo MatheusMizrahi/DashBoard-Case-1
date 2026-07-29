@@ -226,7 +226,23 @@ with aba_geral:
     )
     tempo_etapas.columns = ["etapa", "tempo_medio_min"]
 
-    st.plotly_chart(
+    # Tempo médio por fase macro do atendimento (espera -> lavagem -> pós-lavagem
+    # até retirada) — mesma lógica de período de tempo_etapas acima.
+    FASES_ATENDIMENTO = {
+        "tempo_espera_antes_lavagem_min": "Espera antes da lavagem",
+        "tempo_lavagem_total_min": "Lavagem (total)",
+        "tempo_pos_lavagem_ate_retirada_min": "Pós-lavagem até retirada",
+    }
+    tempo_fases = (
+        df_f[list(FASES_ATENDIMENTO.keys())]
+        .mean()
+        .rename(index=FASES_ATENDIMENTO)
+        .reset_index()
+    )
+    tempo_fases.columns = ["fase", "tempo_medio_min"]
+
+    c_etapas, c_fases = st.columns(2)
+    c_etapas.plotly_chart(
         px.bar(
             tempo_etapas,
             x="etapa",
@@ -234,6 +250,17 @@ with aba_geral:
             text_auto=".1f",
             title=f"Tempo médio por etapa da lavagem — {legenda_periodo}",
             labels={"etapa": "Etapa", "tempo_medio_min": "Tempo médio (min)"},
+        ),
+        width="stretch",
+    )
+    c_fases.plotly_chart(
+        px.bar(
+            tempo_fases,
+            x="fase",
+            y="tempo_medio_min",
+            text_auto=".1f",
+            title=f"Tempo médio por fase do atendimento — {legenda_periodo}",
+            labels={"fase": "Fase", "tempo_medio_min": "Tempo médio (min)"},
         ),
         width="stretch",
     )
