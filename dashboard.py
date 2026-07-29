@@ -10,10 +10,11 @@ Este arquivo aplica, além disso, apenas UMA limpeza automática adicional:
 outliers de registro (não segmentação analítica) em `tempo_lavagem_total_min`
 e `tempo_ate_pagamento_min` via IQR padrão — ver `limpar_ruido_de_registro()`.
 
-Os filtros de "dia de pico" e "retirada tardia" NÃO são limpeza — são
-segmentação analítica com toggle próprio, vivem só na aba "Operação Típica
-(POP)" e nunca alteram `df` em memória, só a view usada nos gráficos daquela
-aba. Ver comentários na seção da aba POP para o motivo de cada um.
+Os filtros de "dia de pico" e "retirada tardia" (`aplicar_segmentacao`) NÃO são
+limpeza — são segmentação analítica com toggle próprio. Aparecem nas duas
+abas (ligados por padrão na aba POP, desligados/opcionais na Visão Geral) e
+nunca alteram `df`/`df_f` em memória, só a view usada nos gráficos de cada
+aba. Ver docstring de `aplicar_segmentacao` para o motivo de cada filtro.
 """
 
 from pathlib import Path
@@ -50,17 +51,15 @@ def limpar_ruido_de_registro(df: pd.DataFrame) -> pd.DataFrame:
     tempo_pos_lavagem_ate_retirada_min: aquelas duas têm um padrão claro por
     trás (dia de pico e comportamento do cliente na retirada), então tratar
     como "ruído" e limpar automaticamente seria apagar informação real sobre
-    a operação. Por isso elas viram filtro de segmentação explícito na aba
-    "Operação Típica", nunca limpeza automática. Não simplificar isso para
-    um único bloco de "remoção de outliers" genérico.
+    a operação. Por isso elas viram filtro de segmentação explícito (função
+    `aplicar_segmentacao` abaixo), nunca limpeza automática. Não simplificar
+    isso para um único bloco de "remoção de outliers" genérico.
     """
-    limites = {}
     mask_valida = pd.Series(True, index=df.index)
     for coluna in ["tempo_lavagem_total_min", "tempo_ate_pagamento_min"]:
         q1, q3 = df[coluna].quantile(0.25), df[coluna].quantile(0.75)
         iqr = q3 - q1
         lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-        limites[coluna] = (lo, hi)
         mask_valida &= df[coluna].between(lo, hi)
     return df[mask_valida].reset_index(drop=True)
 
@@ -73,6 +72,59 @@ def carregar_dados():
     df = limpar_ruido_de_registro(df)
     linhas_removidas_ruido = linhas_antes - len(df)
     return df, linhas_removidas_ruido
+
+
+def aplicar_segmentacao(df_base: pd.DataFrame, key_prefix: str, padrao: bool):
+    """Widgets de segmentação analítica reutilizados na Visão Geral e na aba POP.
+
+    Dois filtros, sempre combináveis, nunca alteram `df_base` — só retornam
+    uma view derivada:
+
+    - "Dia de pico (sábado)": filtro de LINHA (remove a lavagem inteira),
+      porque afeta simultaneamente todos os KPIs/gráficos. Domingo já foi
+      removido na limpeza anterior, então sábado é o único dia de pico que
+      sobra na base. Motivo: concentra ~30% do volume e ~98% dos horários de
+      espera estatisticamente atípicos.
+    - "Retirada tardia (> 45 min)": filtro de VALOR, não de linha — só
+      desconta do cálculo de tempo de retirada (`serie_retirada` retornada
+      separadamente). As outras métricas do mesmo atendimento (lavagem,
+      espera) continuam contando normalmente, porque o tempo até a retirada
+      reflete quando o CLIENTE busca o carro, não a eficiência da operação.
+
+    `padrao` controla se os toggles vêm ligados (aba POP, onde a leitura
+    "típica" é o objetivo da aba) ou desligados (Visão Geral, onde são
+    opcionais). `key_prefix` mantém os widgets das duas abas independentes.
+    """
+    mask_sabado = df_base["dia_semana"] == "Sábado"
+    n_sabado = int(mask_sabado.sum())
+    pct_sabado = (n_sabado / len(df_base) * 100) if len(df_base) else 0.0
+
+    col_a, col_b = st.columns(2)
+    excluir_pico = col_a.checkbox(
+        f"Excluir dia de pico (sábado) — {n_sabado} lavagens ({pct_sabado:.1f}%)",
+        value=padrao,
+        key=f"{key_prefix}_excluir_pico",
+        help="Remove a lavagem inteira do sábado desta visão — afeta todos os tempos e KPIs.",
+    )
+    df_view = df_base[~mask_sabado] if excluir_pico else df_base
+
+    mask_retirada_tardia = df_view["tempo_pos_lavagem_ate_retirada_min"] > LIMITE_RETIRADA_TARDIA_MIN
+    n_retirada_tardia = int(mask_retirada_tardia.sum())
+    pct_retirada_tardia = (n_retirada_tardia / len(df_view) * 100) if len(df_view) else 0.0
+
+    excluir_retirada = col_b.checkbox(
+        f"Excluir retiradas tardias (> {LIMITE_RETIRADA_TARDIA_MIN} min) — "
+        f"{n_retirada_tardia} casos ({pct_retirada_tardia:.1f}%)",
+        value=padrao,
+        key=f"{key_prefix}_excluir_retirada",
+        help="Desconta só do tempo médio de retirada — não remove a linha, as outras métricas continuam valendo.",
+    )
+    serie_retirada = (
+        df_view.loc[~mask_retirada_tardia, "tempo_pos_lavagem_ate_retirada_min"]
+        if excluir_retirada
+        else df_view["tempo_pos_lavagem_ate_retirada_min"]
+    )
+    return df_view, serie_retirada, excluir_pico, excluir_retirada
 
 
 df, linhas_removidas_ruido = carregar_dados()
@@ -134,217 +186,234 @@ aba_geral, aba_pop = st.tabs(["📊 Visão Geral", "🔧 Operação Típica (POP
 
 # ================================================================ ABA GERAL
 with aba_geral:
-    # ------------------------------------------------------------------ KPIs
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total de lavagens", f"{len(df_f):,}".replace(",", "."))
-    col2.metric("Faturamento total", f"R$ {df_f['preco_reais'].sum():,.0f}".replace(",", "."))
-    col3.metric("Ticket médio", f"R$ {df_f['preco_reais'].mean():.2f}")
-    col4.metric("Tempo médio de lavagem", f"{df_f['tempo_lavagem_total_min'].mean():.1f} min")
-
-    st.divider()
-
-    # ------------------------------------------------------------- faturamento
-    st.subheader("Volume e Faturamento")
-
-    serie_mensal = (
-        df_f.set_index("data")
-        .resample("MS")
-        .agg(faturamento=("preco_reais", "sum"), lavagens=("id_lavagem", "count"))
-        .reset_index()
-    )
-
-    c1, c2 = st.columns(2)
-    c1.plotly_chart(
-        px.line(serie_mensal, x="data", y="faturamento", title="Faturamento mensal (R$)"),
-        width="stretch",
-    )
-    c2.plotly_chart(
-        px.line(serie_mensal, x="data", y="lavagens", title="Volume de lavagens por mês"),
-        width="stretch",
-    )
-
-    # ------------------------------------------------------------- operacional
-    st.subheader("Operacional: tempos e volume por dia da semana")
     st.caption(
-        "Visão completa (todos os dias). Para os tempos 'normais' de operação, "
-        "sem o efeito do dia de pico, veja a aba 'Operação Típica (POP)'."
+        "Filtros de segmentação opcionais (mesmos da aba 'Operação Típica'), "
+        "desligados por padrão aqui — ligue para ver o impacto dessa segmentação "
+        "na visão geral inteira."
     )
+    df_view, serie_retirada_geral, excluir_pico_geral, excluir_retirada_geral = aplicar_segmentacao(
+        df_f, key_prefix="geral", padrao=False
+    )
+    if excluir_pico_geral or excluir_retirada_geral:
+        st.info(
+            f"Segmentação ativa nesta aba: {len(df_view):,} lavagens na visão "
+            f"(eram {len(df_f):,} sem segmentação). Todos os gráficos abaixo já refletem isso.".replace(",", ".")
+        )
 
-    tempos_dia = (
-        df_f.groupby("dia_semana")[["tempo_lavagem_total_min", "tempo_espera_antes_lavagem_min"]]
-        .mean()
-        .reindex(ORDEM_DIAS)
-        .reset_index()
-    )
-    volume_dia = (
-        df_f["dia_semana"].value_counts().reindex(ORDEM_DIAS).rename("lavagens").reset_index()
-    )
-    volume_dia.columns = ["dia_semana", "lavagens"]
-
-    c3, c4 = st.columns(2)
-    c3.plotly_chart(
-        px.bar(
-            tempos_dia,
-            x="dia_semana",
-            y=["tempo_lavagem_total_min", "tempo_espera_antes_lavagem_min"],
-            barmode="group",
-            title="Tempo médio (min) por dia da semana",
-        ),
-        width="stretch",
-    )
-    c4.plotly_chart(
-        px.bar(volume_dia, x="dia_semana", y="lavagens", title="Volume de lavagens por dia da semana"),
-        width="stretch",
-    )
-
-    # Tempo médio por etapa do processo de lavagem. Como usa df_f (já recortado
-    # pelo filtro de Período da barra lateral), o comportamento pedido sai de
-    # graça: 1 dia selecionado -> média das lavagens daquele dia; vários dias
-    # -> média do período inteiro.
-    if data_inicio == data_fim:
-        legenda_periodo = f"{data_inicio.strftime('%d/%m/%Y')} ({len(df_f)} lavagens nesse dia)"
+    if df_view.empty:
+        st.warning("Nenhum registro sobra com a segmentação atual.")
     else:
-        n_dias = df_f["data"].dt.date.nunique()
-        legenda_periodo = (
-            f"{data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')} "
-            f"({n_dias} dias, {len(df_f)} lavagens)"
+        st.divider()
+
+        # ------------------------------------------------------------------ KPIs
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total de lavagens", f"{len(df_view):,}".replace(",", "."))
+        col2.metric("Faturamento total", f"R$ {df_view['preco_reais'].sum():,.0f}".replace(",", "."))
+        col3.metric("Ticket médio", f"R$ {df_view['preco_reais'].mean():.2f}")
+        col4.metric("Tempo médio de lavagem", f"{df_view['tempo_lavagem_total_min'].mean():.1f} min")
+
+        st.divider()
+
+        # ------------------------------------------------------------- faturamento
+        st.subheader("Volume e Faturamento")
+
+        serie_mensal = (
+            df_view.set_index("data")
+            .resample("MS")
+            .agg(faturamento=("preco_reais", "sum"), lavagens=("id_lavagem", "count"))
+            .reset_index()
         )
 
-    ETAPAS = {
-        "t_teto_vidros_min": "Teto / Vidros",
-        "t_capo_parabrisa_min": "Capô / Parabrisa",
-        "t_laterais_portas_min": "Laterais / Portas",
-        "t_traseira_min": "Traseira",
-        "t_rodas_pneus_min": "Rodas / Pneus",
-        "t_interior_min": "Interior",
-    }
-    tempo_etapas = (
-        df_f[list(ETAPAS.keys())]
-        .mean()
-        .rename(index=ETAPAS)
-        .reset_index()
-    )
-    tempo_etapas.columns = ["etapa", "tempo_medio_min"]
-
-    # Tempo médio por fase macro do atendimento (espera -> lavagem -> pós-lavagem
-    # até retirada) — mesma lógica de período de tempo_etapas acima.
-    FASES_ATENDIMENTO = {
-        "tempo_espera_antes_lavagem_min": "Espera antes da lavagem",
-        "tempo_lavagem_total_min": "Lavagem (total)",
-        "tempo_pos_lavagem_ate_retirada_min": "Pós-lavagem até retirada",
-    }
-    tempo_fases = (
-        df_f[list(FASES_ATENDIMENTO.keys())]
-        .mean()
-        .rename(index=FASES_ATENDIMENTO)
-        .reset_index()
-    )
-    tempo_fases.columns = ["fase", "tempo_medio_min"]
-
-    c_etapas, c_fases = st.columns(2)
-    c_etapas.plotly_chart(
-        px.bar(
-            tempo_etapas,
-            x="etapa",
-            y="tempo_medio_min",
-            text_auto=".1f",
-            title=f"Tempo médio por etapa da lavagem — {legenda_periodo}",
-            labels={"etapa": "Etapa", "tempo_medio_min": "Tempo médio (min)"},
-        ),
-        width="stretch",
-    )
-    c_fases.plotly_chart(
-        px.bar(
-            tempo_fases,
-            x="fase",
-            y="tempo_medio_min",
-            text_auto=".1f",
-            title=f"Tempo médio por fase do atendimento — {legenda_periodo}",
-            labels={"fase": "Fase", "tempo_medio_min": "Tempo médio (min)"},
-        ),
-        width="stretch",
-    )
-
-    # -------------------------------------------------------------- pagamento
-    st.subheader("Financeiro: mix de pagamento")
-
-    mix_pag = df_f["metodo_pagamento"].value_counts().rename("quantidade").reset_index()
-    mix_pag.columns = ["metodo_pagamento", "quantidade"]
-
-    mix_pag_ano = (
-        df_f.groupby([df_f["data"].dt.year.rename("ano"), "metodo_pagamento"])
-        .size()
-        .reset_index(name="quantidade")
-    )
-
-    c5, c6 = st.columns(2)
-    c5.plotly_chart(
-        px.pie(mix_pag, names="metodo_pagamento", values="quantidade", title="Distribuição por método de pagamento"),
-        width="stretch",
-    )
-    c6.plotly_chart(
-        px.area(
-            mix_pag_ano,
-            x="ano",
-            y="quantidade",
-            color="metodo_pagamento",
-            groupnorm="fraction",
-            title="Evolução do mix de pagamento por ano",
-        ),
-        width="stretch",
-    )
-
-    # ------------------------------------------------------------- satisfação
-    st.subheader("Satisfação do cliente")
-
-    sat_ano = (
-        df_f.groupby(df_f["data"].dt.year.rename("ano"))
-        .agg(
-            nps_medio=("nps_cliente", "mean"),
-            nps_cobertura=("nps_cliente_imputado", lambda s: (~s).mean() * 100),
-            google_medio=("nota_google", "mean"),
-            google_cobertura=("nota_google_imputado", lambda s: (~s).mean() * 100),
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(
+            px.line(serie_mensal, x="data", y="faturamento", title="Faturamento mensal (R$)"),
+            width="stretch",
         )
-        .reset_index()
-    )
+        c2.plotly_chart(
+            px.line(serie_mensal, x="data", y="lavagens", title="Volume de lavagens por mês"),
+            width="stretch",
+        )
 
-    c7, c8 = st.columns(2)
-    fig_nps = px.line(sat_ano, x="ano", y="nps_medio", title="NPS médio por ano (escala 0-10)")
-    fig_nps.add_bar(
-        x=sat_ano["ano"], y=sat_ano["nps_cobertura"], name="% observado (não imputado)", yaxis="y2", opacity=0.3
-    )
-    fig_nps.update_layout(yaxis2=dict(overlaying="y", side="right", title="% observado", range=[0, 100]))
-    c7.plotly_chart(fig_nps, width="stretch")
+        # ------------------------------------------------------------- operacional
+        st.subheader("Operacional: tempos e volume por dia da semana")
+        st.caption(
+            "Para os tempos 'normais' de operação com os filtros já ligados por "
+            "padrão, veja a aba 'Operação Típica (POP)'."
+        )
 
-    fig_google = px.line(sat_ano, x="ano", y="google_medio", title="Nota Google média por ano (escala 1-5)")
-    fig_google.add_bar(
-        x=sat_ano["ano"], y=sat_ano["google_cobertura"], name="% observado (não imputado)", yaxis="y2", opacity=0.3
-    )
-    fig_google.update_layout(yaxis2=dict(overlaying="y", side="right", title="% observado", range=[0, 100]))
-    c8.plotly_chart(fig_google, width="stretch")
+        tempos_dia = (
+            df_view.groupby("dia_semana")[["tempo_lavagem_total_min", "tempo_espera_antes_lavagem_min"]]
+            .mean()
+            .reindex(ORDEM_DIAS)
+            .reset_index()
+        )
+        volume_dia = (
+            df_view["dia_semana"].value_counts().reindex(ORDEM_DIAS).rename("lavagens").reset_index()
+        )
+        volume_dia.columns = ["dia_semana", "lavagens"]
 
-    st.caption(
-        "As barras translúcidas mostram o % de linhas com valor REALMENTE observado "
-        "(não estimado por modelo) — quanto menor, mais a média depende de imputação "
-        "estatística em vez do que o cliente de fato respondeu."
-    )
+        c3, c4 = st.columns(2)
+        c3.plotly_chart(
+            px.bar(
+                tempos_dia,
+                x="dia_semana",
+                y=["tempo_lavagem_total_min", "tempo_espera_antes_lavagem_min"],
+                barmode="group",
+                title="Tempo médio (min) por dia da semana",
+            ),
+            width="stretch",
+        )
+        c4.plotly_chart(
+            px.bar(volume_dia, x="dia_semana", y="lavagens", title="Volume de lavagens por dia da semana"),
+            width="stretch",
+        )
 
-    # --------------------------------------------------------------- produtos
-    st.subheader("Produtos: consumo de insumos e mix de veículos")
+        # Tempo médio por etapa do processo de lavagem. Como usa df_view (já
+        # recortado pelo filtro de Período + segmentação ativa), o
+        # comportamento pedido sai de graça: 1 dia selecionado -> média das
+        # lavagens daquele dia; vários dias -> média do período inteiro.
+        if data_inicio == data_fim:
+            legenda_periodo = f"{data_inicio.strftime('%d/%m/%Y')} ({len(df_view)} lavagens nesse dia)"
+        else:
+            n_dias = df_view["data"].dt.date.nunique()
+            legenda_periodo = (
+                f"{data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')} "
+                f"({n_dias} dias, {len(df_view)} lavagens)"
+            )
 
-    consumo = df_f.groupby("tipo_carro")[PRODUTOS].mean().reset_index()
-    dist_carro = df_f["tipo_carro"].value_counts().rename("quantidade").reset_index()
-    dist_carro.columns = ["tipo_carro", "quantidade"]
+        ETAPAS = {
+            "t_teto_vidros_min": "Teto / Vidros",
+            "t_capo_parabrisa_min": "Capô / Parabrisa",
+            "t_laterais_portas_min": "Laterais / Portas",
+            "t_traseira_min": "Traseira",
+            "t_rodas_pneus_min": "Rodas / Pneus",
+            "t_interior_min": "Interior",
+        }
+        tempo_etapas = (
+            df_view[list(ETAPAS.keys())]
+            .mean()
+            .rename(index=ETAPAS)
+            .reset_index()
+        )
+        tempo_etapas.columns = ["etapa", "tempo_medio_min"]
 
-    c9, c10 = st.columns(2)
-    c9.plotly_chart(
-        px.bar(consumo, x="tipo_carro", y=PRODUTOS, barmode="group", title="Consumo médio (ml) por tipo de carro"),
-        width="stretch",
-    )
-    c10.plotly_chart(
-        px.pie(dist_carro, names="tipo_carro", values="quantidade", title="Distribuição de lavagens por tipo de carro"),
-        width="stretch",
-    )
+        # Tempo médio por fase macro do atendimento (espera -> lavagem ->
+        # pós-lavagem até retirada). A fase de retirada usa `serie_retirada_geral`
+        # (não df_view diretamente) para respeitar o filtro de retirada tardia,
+        # que é column-level e não deve afetar espera/lavagem.
+        tempo_fases = pd.DataFrame({
+            "fase": ["Espera antes da lavagem", "Lavagem (total)", "Pós-lavagem até retirada"],
+            "tempo_medio_min": [
+                df_view["tempo_espera_antes_lavagem_min"].mean(),
+                df_view["tempo_lavagem_total_min"].mean(),
+                serie_retirada_geral.mean(),
+            ],
+        })
+
+        c_etapas, c_fases = st.columns(2)
+        c_etapas.plotly_chart(
+            px.bar(
+                tempo_etapas,
+                x="etapa",
+                y="tempo_medio_min",
+                text_auto=".1f",
+                title=f"Tempo médio por etapa da lavagem — {legenda_periodo}",
+                labels={"etapa": "Etapa", "tempo_medio_min": "Tempo médio (min)"},
+            ),
+            width="stretch",
+        )
+        c_fases.plotly_chart(
+            px.bar(
+                tempo_fases,
+                x="fase",
+                y="tempo_medio_min",
+                text_auto=".1f",
+                title=f"Tempo médio por fase do atendimento — {legenda_periodo}",
+                labels={"fase": "Fase", "tempo_medio_min": "Tempo médio (min)"},
+            ),
+            width="stretch",
+        )
+
+        # -------------------------------------------------------------- pagamento
+        st.subheader("Financeiro: mix de pagamento")
+
+        mix_pag = df_view["metodo_pagamento"].value_counts().rename("quantidade").reset_index()
+        mix_pag.columns = ["metodo_pagamento", "quantidade"]
+
+        mix_pag_ano = (
+            df_view.groupby([df_view["data"].dt.year.rename("ano"), "metodo_pagamento"])
+            .size()
+            .reset_index(name="quantidade")
+        )
+
+        c5, c6 = st.columns(2)
+        c5.plotly_chart(
+            px.pie(mix_pag, names="metodo_pagamento", values="quantidade", title="Distribuição por método de pagamento"),
+            width="stretch",
+        )
+        c6.plotly_chart(
+            px.area(
+                mix_pag_ano,
+                x="ano",
+                y="quantidade",
+                color="metodo_pagamento",
+                groupnorm="fraction",
+                title="Evolução do mix de pagamento por ano",
+            ),
+            width="stretch",
+        )
+
+        # ------------------------------------------------------------- satisfação
+        st.subheader("Satisfação do cliente")
+
+        sat_ano = (
+            df_view.groupby(df_view["data"].dt.year.rename("ano"))
+            .agg(
+                nps_medio=("nps_cliente", "mean"),
+                nps_cobertura=("nps_cliente_imputado", lambda s: (~s).mean() * 100),
+                google_medio=("nota_google", "mean"),
+                google_cobertura=("nota_google_imputado", lambda s: (~s).mean() * 100),
+            )
+            .reset_index()
+        )
+
+        c7, c8 = st.columns(2)
+        fig_nps = px.line(sat_ano, x="ano", y="nps_medio", title="NPS médio por ano (escala 0-10)")
+        fig_nps.add_bar(
+            x=sat_ano["ano"], y=sat_ano["nps_cobertura"], name="% observado (não imputado)", yaxis="y2", opacity=0.3
+        )
+        fig_nps.update_layout(yaxis2=dict(overlaying="y", side="right", title="% observado", range=[0, 100]))
+        c7.plotly_chart(fig_nps, width="stretch")
+
+        fig_google = px.line(sat_ano, x="ano", y="google_medio", title="Nota Google média por ano (escala 1-5)")
+        fig_google.add_bar(
+            x=sat_ano["ano"], y=sat_ano["google_cobertura"], name="% observado (não imputado)", yaxis="y2", opacity=0.3
+        )
+        fig_google.update_layout(yaxis2=dict(overlaying="y", side="right", title="% observado", range=[0, 100]))
+        c8.plotly_chart(fig_google, width="stretch")
+
+        st.caption(
+            "As barras translúcidas mostram o % de linhas com valor REALMENTE observado "
+            "(não estimado por modelo) — quanto menor, mais a média depende de imputação "
+            "estatística em vez do que o cliente de fato respondeu."
+        )
+
+        # --------------------------------------------------------------- produtos
+        st.subheader("Produtos: consumo de insumos e mix de veículos")
+
+        consumo = df_view.groupby("tipo_carro")[PRODUTOS].mean().reset_index()
+        dist_carro = df_view["tipo_carro"].value_counts().rename("quantidade").reset_index()
+        dist_carro.columns = ["tipo_carro", "quantidade"]
+
+        c9, c10 = st.columns(2)
+        c9.plotly_chart(
+            px.bar(consumo, x="tipo_carro", y=PRODUTOS, barmode="group", title="Consumo médio (ml) por tipo de carro"),
+            width="stretch",
+        )
+        c10.plotly_chart(
+            px.pie(dist_carro, names="tipo_carro", values="quantidade", title="Distribuição de lavagens por tipo de carro"),
+            width="stretch",
+        )
 
 # ================================================================== ABA POP
 with aba_pop:
@@ -352,48 +421,12 @@ with aba_pop:
         "Visão para apoiar a definição do POP (Procedimento Operacional Padrão): "
         "os dois filtros abaixo excluem da leitura o que não representa a operação "
         "'normal' do dia a dia. São filtros de SEGMENTAÇÃO ANALÍTICA, não limpeza — "
-        "ligados por padrão só nesta aba; a aba 'Visão Geral' nunca é afetada por eles."
+        "ligados por padrão só nesta aba (na Visão Geral eles existem também, mas "
+        "desligados/opcionais)."
     )
 
-    # --- Filtro 1 (nível de LINHA — afeta todos os KPIs/gráficos desta aba):
-    # Sábado é o único dia de pico que sobrou na base (domingo já foi removido
-    # na limpeza anterior). Concentra ~30% do volume e ~98% dos horários de
-    # espera estatisticamente atípicos — incluir esse dia empurra a média de
-    # "tempo normal de espera" para cima de forma enganosa para fins de POP.
-    mask_sabado = df_f["dia_semana"] == "Sábado"
-    n_sabado = int(mask_sabado.sum())
-    pct_sabado = (n_sabado / len(df_f) * 100) if len(df_f) else 0.0
-
-    excluir_pico = st.checkbox(
-        f"Excluir dia de pico (sábado) — {n_sabado} lavagens ({pct_sabado:.1f}% da visão atual)",
-        value=True,
-        key="pop_excluir_pico",
-        help="Remove a lavagem inteira do sábado da visão desta aba — afeta todos os tempos e KPIs abaixo.",
-    )
-    df_pop = df_f[~mask_sabado] if excluir_pico else df_f
-
-    # --- Filtro 2 (nível de VALOR — só afeta a métrica de retirada, não a linha
-    # inteira): tempo até a retirada reflete quando o CLIENTE busca o carro, não
-    # a eficiência da lavagem em si. Acima de 45 min (limite do IQR calculado
-    # sobre os valores observados dessa coluna) é comportamento do cliente, não
-    # atraso operacional — por isso só é descontado do cálculo de tempo de
-    # retirada, e as demais métricas do mesmo atendimento (lavagem, espera)
-    # continuam contando normalmente.
-    mask_retirada_tardia = df_pop["tempo_pos_lavagem_ate_retirada_min"] > LIMITE_RETIRADA_TARDIA_MIN
-    n_retirada_tardia = int(mask_retirada_tardia.sum())
-    pct_retirada_tardia = (n_retirada_tardia / len(df_pop) * 100) if len(df_pop) else 0.0
-
-    excluir_retirada = st.checkbox(
-        f"Excluir retiradas tardias (> {LIMITE_RETIRADA_TARDIA_MIN} min) — "
-        f"{n_retirada_tardia} casos ({pct_retirada_tardia:.1f}% da visão atual)",
-        value=True,
-        key="pop_excluir_retirada",
-        help="Desconta só do tempo médio de retirada — não remove a linha, as outras métricas do mesmo atendimento continuam valendo.",
-    )
-    serie_retirada_pop = (
-        df_pop.loc[~mask_retirada_tardia, "tempo_pos_lavagem_ate_retirada_min"]
-        if excluir_retirada
-        else df_pop["tempo_pos_lavagem_ate_retirada_min"]
+    df_pop, serie_retirada_pop, excluir_pico, excluir_retirada = aplicar_segmentacao(
+        df_f, key_prefix="pop", padrao=True
     )
 
     if df_pop.empty:
