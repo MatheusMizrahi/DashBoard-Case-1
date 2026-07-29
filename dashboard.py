@@ -298,15 +298,22 @@ with aba_geral:
         tempo_etapas.columns = ["etapa", "tempo_medio_min"]
 
         # Tempo médio por fase macro do atendimento (espera -> lavagem ->
-        # pós-lavagem até retirada). A fase de retirada usa `serie_retirada_geral`
-        # (não df_view diretamente) para respeitar o filtro de retirada tardia,
-        # que é column-level e não deve afetar espera/lavagem.
+        # pós-lavagem até retirada -> até pagamento). A fase de retirada usa
+        # `serie_retirada_geral` (não df_view diretamente) para respeitar o
+        # filtro de retirada tardia, que é column-level e não deve afetar as
+        # demais fases.
         tempo_fases = pd.DataFrame({
-            "fase": ["Espera antes da lavagem", "Lavagem (total)", "Pós-lavagem até retirada"],
+            "fase": [
+                "Espera antes da lavagem",
+                "Lavagem (total)",
+                "Pós-lavagem até retirada",
+                "Até pagamento",
+            ],
             "tempo_medio_min": [
                 df_view["tempo_espera_antes_lavagem_min"].mean(),
                 df_view["tempo_lavagem_total_min"].mean(),
                 serie_retirada_geral.mean(),
+                df_view["tempo_ate_pagamento_min"].mean(),
             ],
         })
 
