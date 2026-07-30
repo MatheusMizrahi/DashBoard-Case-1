@@ -6,11 +6,10 @@ enviada pelo mentor do grupo. É o subconjunto de linhas SEM NENHUM valor nulo
 em nenhuma coluna (~83 mil de ~198 mil linhas originais) — não usa o
 tratamento por imputação/flag que construímos antes (`lavagens_tratada.xlsx`,
 ver `tratamento_dados_ausentes.py`), então não existem mais colunas
-`_imputado`, `contratou_cera` ou `cliente_identificado`. Por instrução do
-grupo, este arquivo é tratado como fonte de verdade e NÃO sofre nenhuma
-limpeza/remoção automática aqui — inclusive os domingos, que voltaram a
-aparecer nessa base, são mantidos nos dados e só entram como opção no filtro
-de segmentação "dia de pico" (ver `aplicar_segmentacao`), nunca removidos.
+`_imputado`, `contratou_cera` ou `cliente_identificado`. O arquivo em si não é
+alterado (não sobrescrevemos o Excel do mentor); a única filtragem acontece
+em `carregar_dados()`, em memória: remove as linhas de domingo (por pedido do
+grupo — não é reintroduzida como opção de segmentação, fica sempre fora).
 
 Os filtros de "dia de pico" e "retirada tardia" (`aplicar_segmentacao`) NÃO são
 limpeza — são segmentação analítica com toggle próprio. Aparecem nas duas
@@ -28,7 +27,7 @@ import streamlit as st
 st.set_page_config(page_title="Lava Rápido Nogueira — Painel Estratégico", layout="wide")
 
 ARQUIVO_TRATADO = Path(__file__).parent / "Base de dados limpa - Revisada.xlsx"
-ORDEM_DIAS = ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"]
+ORDEM_DIAS = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"]
 PRODUTOS = ["shampoo_ml", "cera_ml", "pretinho_ml", "aromatizante_ml"]
 
 # Limite de "retirada tardia": limite de NEGÓCIO (comportamento do cliente na
@@ -41,6 +40,9 @@ LIMITE_RETIRADA_TARDIA_MIN = 45
 def carregar_dados():
     df = pd.read_excel(ARQUIVO_TRATADO, sheet_name="lavagens")
     df["data"] = pd.to_datetime(df["data"])
+    # Pedido do grupo: desconsiderar linhas de domingo (loja não funciona
+    # nesse dia) — filtro em memória, o Excel do mentor não é alterado.
+    df = df[df["dia_semana"] != "Domingo"].reset_index(drop=True)
     return df
 
 
@@ -50,11 +52,10 @@ def aplicar_segmentacao(df_base: pd.DataFrame, key_prefix: str, padrao: bool):
     Dois filtros, sempre combináveis, nunca alteram `df_base` — só retornam
     uma view derivada:
 
-    - "Dias de pico (sábado e domingo)": filtro de LINHA (remove a lavagem
-      inteira), porque afeta simultaneamente todos os KPIs/gráficos. Nesta
-      fonte de dados (planilha revisada pelo mentor) o domingo voltou a
-      aparecer na base, então o filtro cobre os dois dias de fim de semana,
-      não só sábado como na versão anterior.
+    - "Dia de pico (sábado)": filtro de LINHA (remove a lavagem inteira),
+      porque afeta simultaneamente todos os KPIs/gráficos. Domingo já não
+      existe na base (removido em `carregar_dados()`), então sábado é o
+      único dia de pico que sobra para segmentar.
     - "Retirada tardia (> 45 min)": filtro de VALOR, não de linha — só
       desconta do cálculo de tempo de retirada (`serie_retirada` retornada
       separadamente). As outras métricas do mesmo atendimento (lavagem,
@@ -65,16 +66,16 @@ def aplicar_segmentacao(df_base: pd.DataFrame, key_prefix: str, padrao: bool):
     "típica" é o objetivo da aba) ou desligados (Visão Geral, onde são
     opcionais). `key_prefix` mantém os widgets das duas abas independentes.
     """
-    mask_pico = df_base["dia_semana"].isin(["Sábado", "Domingo"])
+    mask_pico = df_base["dia_semana"] == "Sábado"
     n_pico = int(mask_pico.sum())
     pct_pico = (n_pico / len(df_base) * 100) if len(df_base) else 0.0
 
     col_a, col_b = st.columns(2)
     excluir_pico = col_a.checkbox(
-        f"Excluir dias de pico (sábado e domingo) — {n_pico} lavagens ({pct_pico:.1f}%)",
+        f"Excluir dia de pico (sábado) — {n_pico} lavagens ({pct_pico:.1f}%)",
         value=padrao,
         key=f"{key_prefix}_excluir_pico",
-        help="Remove a lavagem inteira de sábado/domingo desta visão — afeta todos os tempos e KPIs.",
+        help="Remove a lavagem inteira do sábado desta visão — afeta todos os tempos e KPIs.",
     )
     df_view = df_base[~mask_pico] if excluir_pico else df_base
 
@@ -141,8 +142,7 @@ with st.sidebar.expander("Sobre os dados"):
         "contém só as lavagens sem nenhum valor nulo em nenhuma coluna — ou seja, "
         "todo cliente dessa base respondeu NPS e avaliou no Google, então a média "
         "dessas duas métricas aqui reflete só quem respondeu, não a clientela toda. "
-        "Domingo está presente nesta versão (diferente da anterior); use o filtro "
-        "'Excluir dias de pico' se quiser ver a operação sem sábado/domingo."
+        "Linhas de domingo foram descontadas (loja não funciona nesse dia)."
     )
 
 if df_f.empty:
@@ -214,10 +214,21 @@ with aba_geral:
             .reindex(ORDEM_DIAS)
             .reset_index()
         )
-        volume_dia = (
+        volume_dia_total = (
             df_view["dia_semana"].value_counts().reindex(ORDEM_DIAS).rename("lavagens").reset_index()
         )
-        volume_dia.columns = ["dia_semana", "lavagens"]
+        volume_dia_total.columns = ["dia_semana", "lavagens"]
+
+        # Quantos dias distintos de cada dia_semana existem na visão atual —
+        # necessário pra calcular a média (ex: 8 sábados no período -> total
+        # de lavagens de sábado / 8). Só usado se o modo "Média por dia" for
+        # selecionado no filtro local abaixo (não altera nenhum outro gráfico).
+        dias_distintos = df_view.groupby("dia_semana")["data"].nunique().reindex(ORDEM_DIAS)
+        volume_dia_medio = (
+            (volume_dia_total.set_index("dia_semana")["lavagens"] / dias_distintos)
+            .rename("lavagens")
+            .reset_index()
+        )
 
         c3, c4 = st.columns(2)
         c3.plotly_chart(
@@ -230,8 +241,18 @@ with aba_geral:
             ),
             width="stretch",
         )
+        modo_volume_dia = c4.radio(
+            "Volume de lavagens por dia da semana:",
+            ["Total no período", "Média por dia"],
+            horizontal=True,
+            key="modo_volume_dia_semana",
+        )
+        if modo_volume_dia == "Total no período":
+            volume_dia_exibir, titulo_volume_dia = volume_dia_total, "Volume total de lavagens por dia da semana"
+        else:
+            volume_dia_exibir, titulo_volume_dia = volume_dia_medio, "Volume médio de lavagens por dia da semana"
         c4.plotly_chart(
-            px.bar(volume_dia, x="dia_semana", y="lavagens", title="Volume de lavagens por dia da semana"),
+            px.bar(volume_dia_exibir, x="dia_semana", y="lavagens", title=titulo_volume_dia),
             width="stretch",
         )
 
