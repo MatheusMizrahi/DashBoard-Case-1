@@ -1,14 +1,16 @@
 """
 Dashboard estratégico — Lava Rápido Nogueira
 
-Fonte de dados: `lavagens_tratada.xlsx`, já com o tratamento de nulos aplicado
-(ver `tratamento_dados_ausentes.py` / relatório correspondente) — domingos
-removidos, `cera_ml` e demais colunas MCAR/MAR tratadas, sem valores nulos
-restantes.
-
-Este arquivo aplica, além disso, apenas UMA limpeza automática adicional:
-outliers de registro (não segmentação analítica) em `tempo_lavagem_total_min`
-e `tempo_ate_pagamento_min` via IQR padrão — ver `limpar_ruido_de_registro()`.
+Fonte de dados: `Base de dados limpa - Revisada.xlsx` (aba `lavagens`),
+enviada pelo mentor do grupo. É o subconjunto de linhas SEM NENHUM valor nulo
+em nenhuma coluna (~83 mil de ~198 mil linhas originais) — não usa o
+tratamento por imputação/flag que construímos antes (`lavagens_tratada.xlsx`,
+ver `tratamento_dados_ausentes.py`), então não existem mais colunas
+`_imputado`, `contratou_cera` ou `cliente_identificado`. Por instrução do
+grupo, este arquivo é tratado como fonte de verdade e NÃO sofre nenhuma
+limpeza/remoção automática aqui — inclusive os domingos, que voltaram a
+aparecer nessa base, são mantidos nos dados e só entram como opção no filtro
+de segmentação "dia de pico" (ver `aplicar_segmentacao`), nunca removidos.
 
 Os filtros de "dia de pico" e "retirada tardia" (`aplicar_segmentacao`) NÃO são
 limpeza — são segmentação analítica com toggle próprio. Aparecem nas duas
@@ -25,53 +27,21 @@ import streamlit as st
 
 st.set_page_config(page_title="Lava Rápido Nogueira — Painel Estratégico", layout="wide")
 
-ARQUIVO_TRATADO = Path(__file__).parent / "lavagens_tratada.xlsx"
-ORDEM_DIAS = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"]
+ARQUIVO_TRATADO = Path(__file__).parent / "Base de dados limpa - Revisada.xlsx"
+ORDEM_DIAS = ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"]
 PRODUTOS = ["shampoo_ml", "cera_ml", "pretinho_ml", "aromatizante_ml"]
 
-# Limite de "retirada tardia": IQR (1.5x) calculado só sobre os valores
-# OBSERVADOS de tempo_pos_lavagem_ate_retirada_min (excluindo os ~17,3% que
-# foram imputados pela mediana no tratamento de nulos) = 45 min. Fixo aqui
-# porque é um limite de negócio (comportamento do cliente), não estatístico
-# recalculado a cada carga — não confundir com limpeza automática por IQR.
+# Limite de "retirada tardia": limite de NEGÓCIO (comportamento do cliente na
+# retirada do carro), não recalculado a cada carga — não confundir com
+# limpeza automática por IQR (que este arquivo não tem mais, ver docstring).
 LIMITE_RETIRADA_TARDIA_MIN = 45
-
-
-def limpar_ruido_de_registro(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove linhas com erro/ruído genuíno de registro.
-
-    Só se aplica a tempo_lavagem_total_min e tempo_ate_pagamento_min: ambas
-    têm baixo volume de valores fora da faixa (~2,2% e ~0,1%) SEM associação
-    com nenhuma variável observada (dia, funcionário, método de pagamento) —
-    ou seja, é ruído aleatório de digitação/medição, não um padrão
-    operacional real. Por isso é tratado como limpeza de fato, ligado por
-    padrão, sem toggle na interface.
-
-    IMPORTANTE — isso é DIFERENTE de tempo_espera_antes_lavagem_min e
-    tempo_pos_lavagem_ate_retirada_min: aquelas duas têm um padrão claro por
-    trás (dia de pico e comportamento do cliente na retirada), então tratar
-    como "ruído" e limpar automaticamente seria apagar informação real sobre
-    a operação. Por isso elas viram filtro de segmentação explícito (função
-    `aplicar_segmentacao` abaixo), nunca limpeza automática. Não simplificar
-    isso para um único bloco de "remoção de outliers" genérico.
-    """
-    mask_valida = pd.Series(True, index=df.index)
-    for coluna in ["tempo_lavagem_total_min", "tempo_ate_pagamento_min"]:
-        q1, q3 = df[coluna].quantile(0.25), df[coluna].quantile(0.75)
-        iqr = q3 - q1
-        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-        mask_valida &= df[coluna].between(lo, hi)
-    return df[mask_valida].reset_index(drop=True)
 
 
 @st.cache_data
 def carregar_dados():
-    df = pd.read_excel(ARQUIVO_TRATADO, sheet_name="lavagens_tratada")
+    df = pd.read_excel(ARQUIVO_TRATADO, sheet_name="lavagens")
     df["data"] = pd.to_datetime(df["data"])
-    linhas_antes = len(df)
-    df = limpar_ruido_de_registro(df)
-    linhas_removidas_ruido = linhas_antes - len(df)
-    return df, linhas_removidas_ruido
+    return df
 
 
 def aplicar_segmentacao(df_base: pd.DataFrame, key_prefix: str, padrao: bool):
@@ -80,11 +50,11 @@ def aplicar_segmentacao(df_base: pd.DataFrame, key_prefix: str, padrao: bool):
     Dois filtros, sempre combináveis, nunca alteram `df_base` — só retornam
     uma view derivada:
 
-    - "Dia de pico (sábado)": filtro de LINHA (remove a lavagem inteira),
-      porque afeta simultaneamente todos os KPIs/gráficos. Domingo já foi
-      removido na limpeza anterior, então sábado é o único dia de pico que
-      sobra na base. Motivo: concentra ~30% do volume e ~98% dos horários de
-      espera estatisticamente atípicos.
+    - "Dias de pico (sábado e domingo)": filtro de LINHA (remove a lavagem
+      inteira), porque afeta simultaneamente todos os KPIs/gráficos. Nesta
+      fonte de dados (planilha revisada pelo mentor) o domingo voltou a
+      aparecer na base, então o filtro cobre os dois dias de fim de semana,
+      não só sábado como na versão anterior.
     - "Retirada tardia (> 45 min)": filtro de VALOR, não de linha — só
       desconta do cálculo de tempo de retirada (`serie_retirada` retornada
       separadamente). As outras métricas do mesmo atendimento (lavagem,
@@ -95,18 +65,18 @@ def aplicar_segmentacao(df_base: pd.DataFrame, key_prefix: str, padrao: bool):
     "típica" é o objetivo da aba) ou desligados (Visão Geral, onde são
     opcionais). `key_prefix` mantém os widgets das duas abas independentes.
     """
-    mask_sabado = df_base["dia_semana"] == "Sábado"
-    n_sabado = int(mask_sabado.sum())
-    pct_sabado = (n_sabado / len(df_base) * 100) if len(df_base) else 0.0
+    mask_pico = df_base["dia_semana"].isin(["Sábado", "Domingo"])
+    n_pico = int(mask_pico.sum())
+    pct_pico = (n_pico / len(df_base) * 100) if len(df_base) else 0.0
 
     col_a, col_b = st.columns(2)
     excluir_pico = col_a.checkbox(
-        f"Excluir dia de pico (sábado) — {n_sabado} lavagens ({pct_sabado:.1f}%)",
+        f"Excluir dias de pico (sábado e domingo) — {n_pico} lavagens ({pct_pico:.1f}%)",
         value=padrao,
         key=f"{key_prefix}_excluir_pico",
-        help="Remove a lavagem inteira do sábado desta visão — afeta todos os tempos e KPIs.",
+        help="Remove a lavagem inteira de sábado/domingo desta visão — afeta todos os tempos e KPIs.",
     )
-    df_view = df_base[~mask_sabado] if excluir_pico else df_base
+    df_view = df_base[~mask_pico] if excluir_pico else df_base
 
     mask_retirada_tardia = df_view["tempo_pos_lavagem_ate_retirada_min"] > LIMITE_RETIRADA_TARDIA_MIN
     n_retirada_tardia = int(mask_retirada_tardia.sum())
@@ -127,7 +97,7 @@ def aplicar_segmentacao(df_base: pd.DataFrame, key_prefix: str, padrao: bool):
     return df_view, serie_retirada, excluir_pico, excluir_retirada
 
 
-df, linhas_removidas_ruido = carregar_dados()
+df = carregar_dados()
 
 st.title("🚗 Lava Rápido Nogueira — Painel Estratégico")
 
@@ -167,15 +137,12 @@ df_f = df[mask]
 
 with st.sidebar.expander("Sobre os dados"):
     st.caption(
-        f"Base já tratada (`lavagens_tratada.xlsx`): domingos removidos, "
-        f"nulos tratados (imputação por modelo, mediana ou categoria explícita "
-        f"'não registrado'/'cliente_nao_identificado' conforme o caso). "
-        f"{linhas_removidas_ruido} linhas adicionais removidas aqui por ruído de "
-        f"registro em tempo_lavagem_total_min/tempo_ate_pagamento_min (IQR). "
-        f"NPS e Nota Google têm grande parte dos valores estimados por modelo "
-        f"(não são resposta real do cliente) — colunas `nps_cliente_imputado` e "
-        f"`nota_google_imputado` marcam quais. As barras translúcidas nos "
-        f"gráficos de satisfação mostram o % realmente observado."
+        "Base enviada pelo mentor do grupo (`Base de dados limpa - Revisada.xlsx`): "
+        "contém só as lavagens sem nenhum valor nulo em nenhuma coluna — ou seja, "
+        "todo cliente dessa base respondeu NPS e avaliou no Google, então a média "
+        "dessas duas métricas aqui reflete só quem respondeu, não a clientela toda. "
+        "Domingo está presente nesta versão (diferente da anterior); use o filtro "
+        "'Excluir dias de pico' se quiser ver a operação sem sábado/domingo."
     )
 
 if df_f.empty:
@@ -377,32 +344,24 @@ with aba_geral:
             df_view.groupby(df_view["data"].dt.year.rename("ano"))
             .agg(
                 nps_medio=("nps_cliente", "mean"),
-                nps_cobertura=("nps_cliente_imputado", lambda s: (~s).mean() * 100),
                 google_medio=("nota_google", "mean"),
-                google_cobertura=("nota_google_imputado", lambda s: (~s).mean() * 100),
             )
             .reset_index()
         )
 
         c7, c8 = st.columns(2)
-        fig_nps = px.line(sat_ano, x="ano", y="nps_medio", title="NPS médio por ano (escala 0-10)")
-        fig_nps.add_bar(
-            x=sat_ano["ano"], y=sat_ano["nps_cobertura"], name="% observado (não imputado)", yaxis="y2", opacity=0.3
+        c7.plotly_chart(
+            px.line(sat_ano, x="ano", y="nps_medio", title="NPS médio por ano (escala 0-10)"),
+            width="stretch",
         )
-        fig_nps.update_layout(yaxis2=dict(overlaying="y", side="right", title="% observado", range=[0, 100]))
-        c7.plotly_chart(fig_nps, width="stretch")
-
-        fig_google = px.line(sat_ano, x="ano", y="google_medio", title="Nota Google média por ano (escala 1-5)")
-        fig_google.add_bar(
-            x=sat_ano["ano"], y=sat_ano["google_cobertura"], name="% observado (não imputado)", yaxis="y2", opacity=0.3
+        c8.plotly_chart(
+            px.line(sat_ano, x="ano", y="google_medio", title="Nota Google média por ano (escala 1-5)"),
+            width="stretch",
         )
-        fig_google.update_layout(yaxis2=dict(overlaying="y", side="right", title="% observado", range=[0, 100]))
-        c8.plotly_chart(fig_google, width="stretch")
 
         st.caption(
-            "As barras translúcidas mostram o % de linhas com valor REALMENTE observado "
-            "(não estimado por modelo) — quanto menor, mais a média depende de imputação "
-            "estatística em vez do que o cliente de fato respondeu."
+            "Lembrete: esta base só contém lavagens sem nenhum nulo — a média de NPS/Nota "
+            "Google aqui é sobre quem respondeu, não sobre a clientela toda (ver 'Sobre os dados')."
         )
 
         # --------------------------------------------------------------- produtos
